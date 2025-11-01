@@ -149,6 +149,7 @@ class Qwen2Config(PretrainedConfig):
         sliding_window=4096,
         max_window_layers=28,
         attention_dropout=0.0,
+        max_segments=32,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -178,6 +179,7 @@ class Qwen2Config(PretrainedConfig):
         if self.rope_scaling is not None and "type" in self.rope_scaling:
             self.rope_scaling["rope_type"] = self.rope_scaling["type"]
         rope_config_validation(self)
+        self.max_segments = max_segments
 
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,
