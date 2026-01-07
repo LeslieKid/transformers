@@ -303,6 +303,12 @@ class LlamaAttention(nn.Module):
 
         # TODO (joao): remove in v4.46 (RoPE is computed in the model, not in the decoder layers)
         self.rotary_emb = LlamaRotaryEmbedding(config=self.config)
+        
+        self.seg_embeddings = nn.Embedding(
+            config.max_segments, 
+            self.head_dim
+        )
+        nn.init.normal_(self.seg_embeddings.weight, mean=0, std=0.02)
 
     def forward(
         self,
@@ -314,6 +320,7 @@ class LlamaAttention(nn.Module):
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
+        seg_ids: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
@@ -340,9 +347,20 @@ class LlamaAttention(nn.Module):
             key_states = self.k_proj(hidden_states)
             value_states = self.v_proj(hidden_states)
 
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+
+        # feature: add segment embeddings
+        if seg_ids is not None:
+            seg_emb = self.seg_embeddings(seg_ids)  # [bs, seq, head_dim]
+            seg_emb = seg_emb.unsqueeze(2)          # [bs, seq, 1, head_dim]
+            
+            key_states = key_states + seg_emb
+            value_states = value_states + seg_emb
+
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
 
         if position_embeddings is None:
             logger.warning_once(
@@ -422,6 +440,7 @@ class LlamaFlashAttention2(LlamaAttention):
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
+        seg_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         if isinstance(past_key_value, StaticCache):
             raise ValueError(
@@ -440,9 +459,20 @@ class LlamaFlashAttention2(LlamaAttention):
         # Flash attention requires the input to have the shape
         # batch_size x seq_length x head_dim x hidden_dim
         # therefore we just need to keep the original shape
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+
+        # feature: add segment embeddings
+        if seg_ids is not None:
+            seg_emb = self.seg_embeddings(seg_ids)  # [bs, seq, head_dim]
+            seg_emb = seg_emb.unsqueeze(2)          # [bs, seq, 1, head_dim]
+            
+            key_states = key_states + seg_emb
+            value_states = value_states + seg_emb
+
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
 
         if position_embeddings is None:
             logger.warning_once(
@@ -535,6 +565,7 @@ class LlamaSdpaAttention(LlamaAttention):
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
+        seg_ids: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         if output_attentions:
@@ -552,6 +583,7 @@ class LlamaSdpaAttention(LlamaAttention):
                 use_cache=use_cache,
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
+                seg_ids=seg_ids,
             )
 
         bsz, q_len, _ = hidden_states.size()
@@ -559,10 +591,21 @@ class LlamaSdpaAttention(LlamaAttention):
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
+        
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+
+        # feature: add segment embeddings
+        if seg_ids is not None:
+            seg_emb = self.seg_embeddings(seg_ids)  # [bs, seq, head_dim]
+            seg_emb = seg_emb.unsqueeze(2)          # [bs, seq, 1, head_dim]
+            
+            key_states = key_states + seg_emb
+            value_states = value_states + seg_emb
 
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
 
         if position_embeddings is None:
             logger.warning_once(
@@ -644,6 +687,7 @@ class LlamaDecoderLayer(nn.Module):
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
+        seg_ids: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
@@ -682,6 +726,7 @@ class LlamaDecoderLayer(nn.Module):
             use_cache=use_cache,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
+            seg_ids=seg_ids,
             **kwargs,
         )
         hidden_states = residual + hidden_states
@@ -870,6 +915,7 @@ class LlamaModel(LlamaPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        seg_ids: Optional[torch.Tensor] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -940,6 +986,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     use_cache,
                     cache_position,
                     position_embeddings,
+                    seg_ids,
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -951,6 +998,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     use_cache=use_cache,
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
+                    seg_ids=seg_ids,
                 )
 
             hidden_states = layer_outputs[0]
@@ -1180,6 +1228,9 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
         ```"""
+        
+        seg_ids = loss_kwargs.pop("seg_ids", None)
+        
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -1198,6 +1249,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             cache_position=cache_position,
+            seg_ids=seg_ids,
         )
 
         hidden_states = outputs[0]
