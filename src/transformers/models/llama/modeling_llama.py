@@ -60,7 +60,7 @@ _CONFIG_FOR_DOC = "LlamaConfig"
 def prepare_4d_attention_mask(attention_mask_with_indices: "torch.Tensor", dtype: "torch.dtype") -> "torch.Tensor":
     r"""
     Expands the attention mask with indices from (batch_size, seq_len) to (batch_size, 1, seq_len, seq_len),
-    while handles packed sequences and transforms the mask to lower triangular form to prevent future peeking.
+    while handling packed sequences and transforms the mask to lower triangular form to prevent future peeking.
     
     Set prompt part as `1` and summary part as `10`.
     """
@@ -1007,7 +1007,8 @@ class LlamaModel(LlamaPreTrainedModel):
         # (i.e., values other than 0 and 1)
         if attention_mask is not None and attention_mask.dim() == 2:
             # Check if attention_mask contains segment information (values > 1)
-            if attention_mask.max() > 1:
+            if (attention_mask > 1).any():
+                # Use the same dtype as inputs_embeds for compatibility
                 attention_mask = prepare_4d_attention_mask(attention_mask, dtype=inputs_embeds.dtype)
 
         causal_mask = self._update_causal_mask(
