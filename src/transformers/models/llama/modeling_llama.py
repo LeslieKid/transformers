@@ -1009,7 +1009,7 @@ class LlamaModel(LlamaPreTrainedModel):
             # Check if attention_mask contains segment information (values > 1)
             if (attention_mask > 1).any():
                 # Use the same dtype as inputs_embeds for compatibility
-                attention_mask = prepare_4d_attention_mask(attention_mask, dtype=inputs_embeds.dtype)
+                attention_mask = prepare_4d_attention_mask(attention_mask, dtype=torch.bfloat16)
 
         causal_mask = self._update_causal_mask(
             attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
