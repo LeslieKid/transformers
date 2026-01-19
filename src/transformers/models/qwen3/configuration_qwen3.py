@@ -13,15 +13,22 @@
 # limitations under the License.
 """Qwen3 model configuration"""
 
-from ...configuration_utils import PreTrainedConfig, layer_type_validation
-from ...modeling_rope_utils import RopeParameters
+from ...configuration_utils import PretrainedConfig
 from ...utils import logging
 
 
 logger = logging.get_logger(__name__)
 
 
-class Qwen3Config(PreTrainedConfig):
+def layer_type_validation(layer_types, num_hidden_layers):
+    """Validate layer_types list."""
+    if layer_types is not None and len(layer_types) != num_hidden_layers:
+        raise ValueError(
+            f"Length of `layer_types` ({len(layer_types)}) must match `num_hidden_layers` ({num_hidden_layers})"
+        )
+
+
+class Qwen3Config(PretrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`Qwen3Model`]. It is used to instantiate a
     Qwen3 model according to the specified arguments, defining the model architecture. Instantiating a configuration
@@ -66,7 +73,7 @@ class Qwen3Config(PreTrainedConfig):
             relevant if `config.is_decoder=True`.
         tie_word_embeddings (`bool`, *optional*, defaults to `False`):
             Whether the model's input and output word embeddings should be tied.
-        rope_parameters (`RopeParameters`, *optional*):
+        rope_parameters (`dict`, *optional*):
             Dictionary containing the configuration parameters for the RoPE embeddings. The dictionary should contain
             a value for `rope_theta` and optionally parameters used for scaling in case you want to use RoPE
             with longer `max_position_embeddings`.
@@ -83,6 +90,8 @@ class Qwen3Config(PreTrainedConfig):
             Attention pattern for each layer.
         attention_dropout (`float`, *optional*, defaults to 0.0):
             The dropout ratio for the attention probabilities.
+        max_segments (`int`, *optional*, defaults to 32):
+            Maximum number of segments for thought-specific positional embeddings.
         pad_token_id (`int`, *optional*):
             Padding token id.
         bos_token_id (`int`, *optional*):
@@ -137,13 +146,14 @@ class Qwen3Config(PreTrainedConfig):
         rms_norm_eps: int | None = 1e-6,
         use_cache: bool | None = True,
         tie_word_embeddings: bool | None = False,
-        rope_parameters: RopeParameters | dict[str, RopeParameters] | None = None,
+        rope_parameters: dict | None = None,
         attention_bias: bool | None = False,
         use_sliding_window: bool | None = False,
         sliding_window: int | None = 4096,
         max_window_layers: int | None = 28,
         layer_types: list[str] | None = None,
         attention_dropout: float | None = 0.0,
+        max_segments: int | None = 32,
         pad_token_id: int | None = None,
         bos_token_id: int | None = None,
         eos_token_id: int | None = None,
@@ -171,6 +181,7 @@ class Qwen3Config(PreTrainedConfig):
         self.use_cache = use_cache
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
+        self.max_segments = max_segments
 
         self.layer_types = layer_types
         if self.layer_types is None:
