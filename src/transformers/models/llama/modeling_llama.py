@@ -57,6 +57,51 @@ _CHECKPOINT_FOR_DOC = "meta-llama/Llama-2-7b-hf"
 _CONFIG_FOR_DOC = "LlamaConfig"
 
 
+def prepare_4d_attention_mask(attention_mask_with_indices: "torch.Tensor", dtype: "torch.dtype") -> "torch.Tensor":
+    r"""
+    Expands the attention mask with indices from (batch_size, seq_len) to (batch_size, 1, seq_len, seq_len),
+    while handling packed sequences and transforms the mask to lower triangular form to prevent future peeking.
+    
+    Set prompt part as `1` and summary part as `10`.
+    """
+    assert attention_mask_with_indices.dim() == 2
+    bsz, seq_len = attention_mask_with_indices.size()
+    device = attention_mask_with_indices.device
+    expanded_mask = attention_mask_with_indices[:, None, None, :].expand(bsz, 1, seq_len, seq_len)
+    # Create a binary mask from the original mask where zeros remain zeros and all other values are set to one
+    padding_mask = torch.where(expanded_mask != 0, 1, 0)
+    
+    # Create a block-diagonal mask.
+    attention_mask_4d = torch.eq(expanded_mask, expanded_mask.transpose(-1, -2)).int() * padding_mask
+    # Special case 1: All non-zero tokens can attend to tokens with ID 1, which represents the prompt part
+    is_special_token_1 = (expanded_mask == 1)
+    can_attend_to_1 = padding_mask.transpose(-1, -2) * is_special_token_1
+    # Special case 2: Tokens with ID 10 can attend to all non-zero tokens
+    is_special_token_10 = (expanded_mask.transpose(-1, -2) == 10)
+    token_10_can_attend = is_special_token_10 * padding_mask
+    
+    # Combine all attention patterns (using logical OR)
+    combined_mask = torch.clamp(attention_mask_4d + can_attend_to_1 + token_10_can_attend, 0, 1)
+    
+    # Use the lower triangular mask to zero out the upper triangular part
+    tril_mask = torch.tril(torch.ones((seq_len, seq_len), dtype=combined_mask.dtype, device=device))
+    combined_mask = combined_mask * tril_mask 
+    
+    # Convert to the final mask with the desired dtype in one clean step
+    # Create a new tensor directly with the target dtype
+    if dtype == torch.bool:
+        # For boolean mask (True = masked, False = not masked)
+        final_attention_mask = ~(combined_mask > 0)
+    else:
+        # For float masks (0 = keep, large negative = mask)
+        min_dtype = torch.finfo(dtype).min
+        zeros = torch.zeros(combined_mask.shape, dtype=dtype, device=device)
+        ones = torch.ones(combined_mask.shape, dtype=dtype, device=device)
+        final_attention_mask = torch.where(combined_mask > 0, zeros, ones * min_dtype)
+    
+    return final_attention_mask
+
+
 class LlamaRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         """
@@ -303,6 +348,12 @@ class LlamaAttention(nn.Module):
 
         # TODO (joao): remove in v4.46 (RoPE is computed in the model, not in the decoder layers)
         self.rotary_emb = LlamaRotaryEmbedding(config=self.config)
+        
+        self.seg_embeddings = nn.Embedding(
+            config.max_segments, 
+            self.head_dim
+        )
+        nn.init.normal_(self.seg_embeddings.weight, mean=0, std=0.02)
 
     def forward(
         self,
@@ -314,6 +365,7 @@ class LlamaAttention(nn.Module):
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
+        seg_ids: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
@@ -340,9 +392,20 @@ class LlamaAttention(nn.Module):
             key_states = self.k_proj(hidden_states)
             value_states = self.v_proj(hidden_states)
 
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+
+        # feature: add segment embeddings
+        if seg_ids is not None:
+            seg_emb = self.seg_embeddings(seg_ids)  # [bs, seq, head_dim]
+            seg_emb = seg_emb.unsqueeze(2)          # [bs, seq, 1, head_dim]
+            
+            key_states = key_states + seg_emb
+            value_states = value_states + seg_emb
+
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
 
         if position_embeddings is None:
             logger.warning_once(
@@ -422,6 +485,7 @@ class LlamaFlashAttention2(LlamaAttention):
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
+        seg_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         if isinstance(past_key_value, StaticCache):
             raise ValueError(
@@ -440,9 +504,20 @@ class LlamaFlashAttention2(LlamaAttention):
         # Flash attention requires the input to have the shape
         # batch_size x seq_length x head_dim x hidden_dim
         # therefore we just need to keep the original shape
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+
+        # feature: add segment embeddings
+        if seg_ids is not None:
+            seg_emb = self.seg_embeddings(seg_ids)  # [bs, seq, head_dim]
+            seg_emb = seg_emb.unsqueeze(2)          # [bs, seq, 1, head_dim]
+            
+            key_states = key_states + seg_emb
+            value_states = value_states + seg_emb
+
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
 
         if position_embeddings is None:
             logger.warning_once(
@@ -535,6 +610,7 @@ class LlamaSdpaAttention(LlamaAttention):
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
+        seg_ids: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         if output_attentions:
@@ -552,6 +628,7 @@ class LlamaSdpaAttention(LlamaAttention):
                 use_cache=use_cache,
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
+                seg_ids=seg_ids,
             )
 
         bsz, q_len, _ = hidden_states.size()
@@ -559,10 +636,21 @@ class LlamaSdpaAttention(LlamaAttention):
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
+        
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+
+        # feature: add segment embeddings
+        if seg_ids is not None:
+            seg_emb = self.seg_embeddings(seg_ids)  # [bs, seq, head_dim]
+            seg_emb = seg_emb.unsqueeze(2)          # [bs, seq, 1, head_dim]
+            
+            key_states = key_states + seg_emb
+            value_states = value_states + seg_emb
 
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
 
         if position_embeddings is None:
             logger.warning_once(
@@ -644,6 +732,7 @@ class LlamaDecoderLayer(nn.Module):
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
+        seg_ids: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
@@ -682,6 +771,7 @@ class LlamaDecoderLayer(nn.Module):
             use_cache=use_cache,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
+            seg_ids=seg_ids,
             **kwargs,
         )
         hidden_states = residual + hidden_states
@@ -870,6 +960,7 @@ class LlamaModel(LlamaPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        seg_ids: Optional[torch.Tensor] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -912,6 +1003,14 @@ class LlamaModel(LlamaPreTrainedModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
+        # Apply custom 4D attention mask preparation if attention_mask contains segment indices
+        # (i.e., values other than 0 and 1)
+        if attention_mask is not None and attention_mask.dim() == 2:
+            # Check if attention_mask contains segment information (values > 1)
+            if (attention_mask > 1).any():
+                # Use the same dtype as inputs_embeds for compatibility
+                attention_mask = prepare_4d_attention_mask(attention_mask, dtype=torch.bfloat16)
+
         causal_mask = self._update_causal_mask(
             attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
         )
@@ -940,6 +1039,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     use_cache,
                     cache_position,
                     position_embeddings,
+                    seg_ids,
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -951,6 +1051,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     use_cache=use_cache,
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
+                    seg_ids=seg_ids,
                 )
 
             hidden_states = layer_outputs[0]
@@ -1180,6 +1281,9 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
         ```"""
+        
+        seg_ids = loss_kwargs.pop("seg_ids", None)
+        
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -1198,6 +1302,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             cache_position=cache_position,
+            seg_ids=seg_ids,
         )
 
         hidden_states = outputs[0]
