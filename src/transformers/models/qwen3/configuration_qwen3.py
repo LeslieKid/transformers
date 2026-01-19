@@ -197,6 +197,13 @@ class Qwen3Config(PretrainedConfig):
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
         self.tie_word_embeddings = tie_word_embeddings
+        
+        # Set default rope_parameters if not provided
+        if rope_parameters is None:
+            rope_parameters = {
+                "rope_type": "default",
+                "rope_theta": 10000.0,
+            }
         self.rope_parameters = rope_parameters
 
         super().__init__(**kwargs)
